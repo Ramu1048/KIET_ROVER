@@ -21,7 +21,7 @@
 #define RR_REN 16
 #define RR_LEN 17
 
-// ================= DATA STRUCT =================
+// ================= DATA =================
 typedef struct struct_message {
   int x;
   int y;
@@ -30,74 +30,101 @@ typedef struct struct_message {
 
 struct_message data;
 
-// ================= MOTOR CONTROL FUNCTION =================
+// ================= SETTINGS =================
+int deadZone = 150;
+float expo = 1.8;        // 🔥 sensitivity curve (1 = linear, 2 = smoother)
+float smoothFactor = 0.3; // 🔥 smoothing (0.1–0.3 best)
 
-// 🔥 Handles forward + backward + stop automatically
+// current speeds (for smoothing)
+float leftCurrent = 0;
+float rightCurrent = 0;
+
+// ✅ FAILSAFE TIMER
+unsigned long lastReceiveTime = 0;
+unsigned long timeout = 400; // ms (300–500 best)
+
+// ================= MOTOR =================
 void setMotor(int rpwm, int lpwm, int speed) {
   if (speed > 0) {
     analogWrite(rpwm, 0);
     analogWrite(lpwm, speed);
-  } 
-  else if (speed < 0) {
+  } else if (speed < 0) {
     analogWrite(rpwm, -speed);
     analogWrite(lpwm, 0);
-  } 
-  else {
+  } else {
     analogWrite(rpwm, 0);
     analogWrite(lpwm, 0);
   }
 }
 
-// ================= ESP-NOW RECEIVE =================
+// 🛑 STOP FUNCTION (important)
+void stopMotors() {
+  setMotor(FL_RPWM, FL_LPWM, 0);
+  setMotor(RL_RPWM, RL_LPWM, 0);
+  setMotor(FR_RPWM, FR_LPWM, 0);
+  setMotor(RR_RPWM, RR_LPWM, 0);
 
+  leftCurrent = 0;
+  rightCurrent = 0;
+}
+
+
+// ================= RECEIVE =================
 void onReceive(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
   memcpy(&data, incomingData, sizeof(data));
 
+   // ✅ Update last signal time
+  lastReceiveTime = millis();
+
   int center = 2048;
-  int deadZone = 200;
 
-  // Convert joystick values
-  int x = data.x - center;
-  int y = center - data.y;  // forward positive
+  float x = data.x - center;
+  float y = center - data.y;
 
-  // Apply dead zone
+  // Dead zone
   if (abs(x) < deadZone) x = 0;
   if (abs(y) < deadZone) y = 0;
 
-  // Map to PWM range (-255 to 255)
-  x = map(x, -2048, 2048, -255, 255);
-  y = map(y, -2048, 2048, -255, 255);
+  // Normalize (-1 to 1)
+  x /= 2048.0;
+  y /= 2048.0;
 
-  // 🎮 Differential drive (8-direction control)
-  int leftSpeed  = y + x;
-  int rightSpeed = y - x;
+  // 🔥 EXPO CURVE (real joystick feel)
+  x = pow(abs(x), expo) * (x >= 0 ? 1 : -1);
+  y = pow(abs(y), expo) * (y >= 0 ? 1 : -1);
 
-  // Limit values
-  leftSpeed  = constrain(leftSpeed, -255, 255);
-  rightSpeed = constrain(rightSpeed, -255, 255);
+  // Arcade drive
+  float leftTarget  = y + x;
+  float rightTarget = y - x;
 
-  // Apply speeds to motors
-  // LEFT SIDE
-  setMotor(FL_RPWM, FL_LPWM, leftSpeed);
-  setMotor(RL_RPWM, RL_LPWM, leftSpeed);
+  // Clamp
+  leftTarget  = constrain(leftTarget, -1, 1);
+  rightTarget = constrain(rightTarget, -1, 1);
 
-  // RIGHT SIDE
-  setMotor(FR_RPWM, FR_LPWM, rightSpeed);
-  setMotor(RR_RPWM, RR_LPWM, rightSpeed);
+  // Convert to PWM
+  leftTarget  *= 255;
+  rightTarget *= 255;
+
+  // 🔥 SMOOTHING (important)
+  leftCurrent  = leftCurrent + (leftTarget - leftCurrent) * smoothFactor;
+  rightCurrent = rightCurrent + (rightTarget - rightCurrent) * smoothFactor;
+
+  // Apply motors
+  setMotor(FL_RPWM, FL_LPWM, leftCurrent);
+  setMotor(RL_RPWM, RL_LPWM, leftCurrent);
+
+  setMotor(FR_RPWM, FR_LPWM, rightCurrent);
+  setMotor(RR_RPWM, RR_LPWM, rightCurrent);
 
   // Debug
-  Serial.print("X: "); Serial.print(data.x);
-  Serial.print(" | Y: "); Serial.print(data.y);
-  Serial.print(" | Left: "); Serial.print(leftSpeed);
-  Serial.print(" | Right: "); Serial.println(rightSpeed);
+  Serial.print("L: "); Serial.print(leftCurrent);
+  Serial.print(" | R: "); Serial.println(rightCurrent);
 }
 
 // ================= SETUP =================
-
 void setup() {
   Serial.begin(115200);
 
-  // Enable pins
   pinMode(FL_REN, OUTPUT); pinMode(FL_LEN, OUTPUT);
   pinMode(FR_REN, OUTPUT); pinMode(FR_LEN, OUTPUT);
   pinMode(RL_REN, OUTPUT); pinMode(RL_LEN, OUTPUT);
@@ -108,28 +135,33 @@ void setup() {
   digitalWrite(RL_REN, HIGH); digitalWrite(RL_LEN, HIGH);
   digitalWrite(RR_REN, HIGH); digitalWrite(RR_LEN, HIGH);
 
-  // PWM pins
   pinMode(FL_RPWM, OUTPUT); pinMode(FL_LPWM, OUTPUT);
   pinMode(FR_RPWM, OUTPUT); pinMode(FR_LPWM, OUTPUT);
   pinMode(RL_RPWM, OUTPUT); pinMode(RL_LPWM, OUTPUT);
   pinMode(RR_RPWM, OUTPUT); pinMode(RR_LPWM, OUTPUT);
 
-  // ESP-NOW Setup
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
 
-  Serial.print("Receiver MAC Address: ");
+  Serial.print("Receiver MAC: ");
   Serial.println(WiFi.macAddress());
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW Init Failed");
+    Serial.println("ESP-NOW Failed");
     return;
   }
 
   esp_now_register_recv_cb(onReceive);
+
+  // 🛑 ensure stopped at boot
+  stopMotors();
 }
 
 // ================= LOOP =================
-
 void loop() {
-  // Nothing needed
+   // 🛑 FAILSAFE CHECK
+  if (millis() - lastReceiveTime > timeout) {
+    stopMotors();
+  }
 }
